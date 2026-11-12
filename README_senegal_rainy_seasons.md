@@ -65,6 +65,15 @@ For **50 seasons, 1975–2024**, if all data years are available:
 python senegal_rainy_seasons_updated.py --renderer matplotlib --start 1975 --end 2024
 ```
 
+The two timeline plots use the same y-axis limits in every frame. By default,
+the limits are calculated symmetrically from all available target years. To set
+explicit limits, pass two values for each plot, for example:
+
+```bash
+python senegal_rainy_seasons_updated.py --renderer matplotlib --start 1975 --end 2024 \
+  --temp-axis -3 3 --rain-axis -100 100
+```
+
 **June–August instead of JJAS**:
 
 ```bash

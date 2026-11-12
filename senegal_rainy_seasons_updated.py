@@ -180,6 +180,39 @@ def open_climate() -> xr.Dataset:
     return bbox_terraclimate(ds)
 
 
+def close_azure_finalizers() -> int:
+    """Run adlfs Azure cleanup callbacks before fsspec stops its event loop."""
+    import weakref
+
+    registry = getattr(weakref.finalize, "_registry", None)
+    if registry is None:
+        warnings.warn("Azure cleanup unavailable on this Python implementation")
+        return 0
+    count = 0
+    for finalizer in list(registry):
+        peek = finalizer.peek()
+        if peek is None:
+            continue
+        _, func, args, _ = peek
+        if (getattr(func, "__module__", "") != "fsspec.asyn"
+                or getattr(func, "__name__", "") != "sync"
+                or len(args) < 3):
+            continue
+        callback, resource = args[1], args[2]
+        if (getattr(callback, "__module__", "") != "adlfs.utils"
+                or getattr(callback, "__name__", "") not in {
+                    "close_service_client", "close_credential",
+                    "close_container_client"}
+                or not type(resource).__module__.startswith("adlfs.")):
+            continue
+        try:
+            finalizer()
+            count += 1
+        except Exception as exc:
+            warnings.warn(f"Azure cleanup callback failed: {exc}")
+    return count
+
+
 def load_climate(years: list[int], months: tuple[int, ...]) -> xr.Dataset:
     """Read *only* baseline + target months, then aggregate before computing."""
     needed = set(range(BASE[0], BASE[1] + 1)) | set(years)
@@ -203,7 +236,11 @@ def load_climate(years: list[int], months: tuple[int, ...]) -> xr.Dataset:
     print(f"Calculating seasonal climatology from {BASE[0]}-{BASE[1]} and "
           f"{len(available_targets)} target season(s) (no raw file download).")
     # Compute the reduced seasonal grid only, not the full monthly source cube.
-    seas = seasonal(ds, months).compute()
+    try:
+        seas = seasonal(ds, months).compute()
+    finally:
+        # Materialize the seasonal values before closing the remote store.
+        ds.close()
     for var, lo, hi in (("t", -30, 65), ("p", 0, 10000)):
         med = float(seas[var].median(skipna=True))
         if not np.isfinite(med) or not lo <= med <= hi:
@@ -317,11 +354,28 @@ def _mean(arr: np.ndarray, mask: np.ndarray) -> float:
     return float(z.mean()) if z.size else float("nan")
 
 
+def _axis_limits(values: list[float], requested: tuple[float, float] | None,
+                 label: str) -> tuple[float, float]:
+    if requested is not None:
+        low, high = requested
+        if not np.isfinite(low) or not np.isfinite(high) or low >= high:
+            raise ValueError(f"{label} axis must be finite and increasing")
+        return low, high
+    finite = np.asarray(values, dtype="float64")
+    finite = finite[np.isfinite(finite)]
+    if not finite.size:
+        return -1.0, 1.0
+    bound = max(float(np.max(np.abs(finite))) * 1.1, 1.0)
+    return -bound, bound
+
+
 def compose(year: int, map_png: Path, years: list[int],
             temp_series: list[float], rain_series: list[float],
             extent: tuple[float, float, float, float], poly,
             renderer: str, label_on_forge: bool, output: Path,
-            months: tuple[int, ...] = MONTHS) -> None:
+            months: tuple[int, ...] = MONTHS,
+            temp_axis: tuple[float, float] | None = None,
+            rain_axis: tuple[float, float] | None = None) -> None:
     """Use matplotlib for the plate/legend/timeline over the rendered raster."""
     import matplotlib
     matplotlib.use("Agg")
@@ -380,22 +434,31 @@ def compose(year: int, map_png: Path, years: list[int],
     fig.text(0.080, 0.035, f"Rain baseline > {P_BASE_MIN:g} mm", fontsize=6.8,
              color="#5d6670")
 
-    for box, values, ttl, neg, pos in (
-        ([0.380, 0.168, 0.57, 0.103], temp_series,
-         "Mean temperature anomaly (°C)", "#3b79ae", "#ce7945"),
-        ([0.380, 0.045, 0.57, 0.103], rain_series,
-         "Mean rainfall anomaly (%)", "#a87b43", "#358f9a"),
-    ):
+    plot_specs = (
+        ([0.380, 0.190, 0.57, 0.090], temp_series,
+         "Mean temperature anomaly (°C)", "#3b79ae", "#ce7945",
+         _axis_limits(temp_series, temp_axis, "Temperature")),
+        ([0.380, 0.050, 0.57, 0.090], rain_series,
+         "Mean rainfall anomaly (%)", "#a87b43", "#358f9a",
+         _axis_limits(rain_series, rain_axis, "Rainfall")),
+    )
+    for plot_index, (box, values, ttl, neg, pos, y_limits) in enumerate(plot_specs):
         p = fig.add_axes(box, facecolor="none")
         colors = [neg if v < 0 else pos for v in values]
         p.bar(years, values, color=colors, width=0.78, zorder=2)
         p.axhline(0, color="#6d7177", lw=0.6, zorder=1)
         p.axvline(year, color="#212121", lw=1.6, zorder=3)
         p.set_xlim(min(years)-1, max(years)+1)
+        p.set_ylim(*y_limits)
         p.set_title(ttl, loc="left", fontsize=8.5, weight="bold", pad=4)
+        p.set_ylabel("°C" if "temperature" in ttl.lower() else "%", fontsize=7)
         p.spines[["top", "right"]].set_visible(False)
         p.tick_params(axis="both", labelsize=7)
         p.set_xticks(sorted(set([years[0], years[-1]] + [y for y in years if y % 10 == 0])))
+        if plot_index == 0:
+            p.tick_params(axis="x", labelbottom=False)
+        else:
+            p.set_xlabel("Season year", fontsize=7, labelpad=2)
     fig.text(0.95, 0.011, "TerraClimate · Copernicus DEM GLO-90 · geoBoundaries  |  "
              f"baseline {BASE[0]}–{BASE[1]}", fontsize=6.6,
              ha="right", color="#565e62")
@@ -424,6 +487,12 @@ def parse_cli() -> argparse.Namespace:
                     help="Months of each calendar-year season (default 6 7 8 9)")
     ap.add_argument("--output", type=Path, default=Path("senegal_out"))
     ap.add_argument("--fps", type=int, default=4)
+    ap.add_argument("--temp-axis", type=float, nargs=2, metavar=("MIN", "MAX"),
+                    help="Fixed temperature plot y-axis limits; default uses "
+                         "shared symmetric limits from all target years")
+    ap.add_argument("--rain-axis", type=float, nargs=2, metavar=("MIN", "MAX"),
+                    help="Fixed rainfall plot y-axis limits; default uses "
+                         "shared symmetric limits from all target years")
     ap.add_argument("--no-video", action="store_true")
     ap.add_argument("--forge-labels", action="store_true",
                     help="EXPERIMENTAL: overlay projected cities/ADM0 on forge3d image")
@@ -439,6 +508,8 @@ def main() -> None:
     if args.start > args.end or args.fps < 1:
         raise ValueError("Invalid start/end or fps")
     years = sorted(set(args.years if args.years else range(args.start, args.end+1)))
+    temp_axis = tuple(args.temp_axis) if args.temp_axis else None
+    rain_axis = tuple(args.rain_axis) if args.rain_axis else None
     out = args.output
     rawdir, frames, cache = out / "renders", out / "frames", out / "cache"
     for d in (rawdir, frames, cache):
@@ -487,7 +558,8 @@ def main() -> None:
         else:
             render_matplotlib_map(terrain, inside, temp_grids[i], rain_grids[i], raw_file)
         compose(y, raw_file, years, temp_means, rain_means, extent, poly,
-                args.renderer, args.forge_labels, frames / f"frame_{i:04d}.png", months)
+                args.renderer, args.forge_labels, frames / f"frame_{i:04d}.png",
+                months, temp_axis, rain_axis)
         print(f"Frame {i+1}/{len(years)}: {y}")
     if not args.no_video:
         make_video(frames, out / "senegal_rainy_seasons.mp4", args.fps)
@@ -495,4 +567,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        closed = close_azure_finalizers()
+        if closed:
+            print(f"Closed {closed} adlfs Azure resource(s) before Python shutdown.")
